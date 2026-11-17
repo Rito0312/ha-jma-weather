@@ -1,5 +1,5 @@
 """HA と組み合わせた動作のテスト（pytest-homeassistant-custom-component）."""
-from datetime import date, timedelta, timezone
+from datetime import timedelta, timezone
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -42,7 +42,12 @@ def observations():
     return obs
 
 
-OPEN_METEO = {date(2026, 11, 17) + timedelta(days=i): (10.0 + i, 1.0 + i) for i in range(10)}
+OM = load("open_meteo_sapporo.json")
+
+
+def om_day(i):
+    return OM["daily"]["temperature_2m_max"][i], OM["daily"]["temperature_2m_min"][i]
+
 
 AREA_TABLE = {
     "offices": {
@@ -69,7 +74,7 @@ def api():
         mock = AsyncMock()
         mock.observations.return_value = observations()
         mock.forecast.return_value = load("forecast_016000.json")
-        mock.open_meteo_daily.return_value = OPEN_METEO
+        mock.open_meteo.return_value = OM
         cls.return_value = mock
         yield mock
 
@@ -104,8 +109,16 @@ async def _daily(hass, entity_id):
     return resp[entity_id]["forecast"]
 
 
+async def _forecast(hass, entity_id, kind):
+    resp = await hass.services.async_call(
+        "weather", "get_forecasts", {"entity_id": entity_id, "type": kind},
+        blocking=True, return_response=True,
+    )
+    return resp[entity_id]["forecast"]
+
+
 @pytest.mark.freeze_time(NOW)
-async def test_entity_open_meteo(hass: HomeAssistant, setup_home, api):
+async def test_entity_normal(hass: HomeAssistant, setup_home, api):
     e = entry()
     await _setup(hass, e)
     assert e.state is ConfigEntryState.LOADED
@@ -114,70 +127,114 @@ async def test_entity_open_meteo(hass: HomeAssistant, setup_home, api):
     raw = load("amedas_14163_20261117_12.json")["20261117123000"]
     assert st.attributes["temperature"] == raw["temp"][0]
     assert st.attributes["humidity"] == raw["humidity"][0]
+    # 風速は HA の天気の既定の単位（km/h）で出る
+    assert st.attributes["wind_speed_unit"] == "km/h"
+    assert st.attributes["wind_speed"] == round(raw["wind"][0] * 3.6, 2)
     assert st.attributes["observation_time"] == "2026-11-17T12:30:00+09:00"
+    assert st.attributes["observation_source"] == "amedas"
+    assert st.attributes["daily_source"] == "jma"
+    assert st.attributes["hourly_source"] == "open_meteo"
     assert st.attributes["forecast_area"] == "空知地方"
     assert st.attributes["today_weather"]
-    assert "Open-Meteo" in st.attributes["attribution"]
+    assert st.attributes["problems"] == []
+    assert "気象庁" in st.attributes["attribution"] and "Open-Meteo" in st.attributes["attribution"]
     # 昼なので日照から判定する（太陽高度の計算が動いていること）
     assert st.attributes["condition_source"] == "amedas_sunshine"
     assert st.state in {"sunny", "partlycloudy", "cloudy"}
-    api.open_meteo_daily.assert_awaited_once_with(43.06, 141.33)
+    api.open_meteo.assert_awaited_once_with(43.06, 141.33)
 
     fc = await _daily(hass, entity_id)
     assert len(fc) == 8
     assert fc[0]["datetime"] == "2026-11-17T00:00:00+09:00"
-    assert fc[0]["temperature"] == 10.0 and fc[0]["templow"] == 1.0
-    assert fc[7]["temperature"] == 17.0
+    assert (fc[0]["temperature"], fc[0]["templow"]) == om_day(0)
+    assert fc[7]["temperature"] == om_day(7)[0]
     assert all("condition" in d for d in fc)
     assert all("precipitation_probability" in d for d in fc[1:])
+
+    hourly = await _forecast(hass, entity_id, "hourly")
+    assert len(hourly) == 48
+    assert hourly[0]["datetime"] == "2026-11-17T12:00:00+09:00"
+    i = OM["hourly"]["time"].index("2026-11-17T12:00")
+    assert hourly[0]["temperature"] == OM["hourly"]["temperature_2m"][i]
+    assert hourly[0]["humidity"] == OM["hourly"]["relative_humidity_2m"][i]
+    assert "precipitation" in hourly[0] and "precipitation_probability" in hourly[0]
 
 
 @pytest.mark.freeze_time(NOW)
 async def test_entity_jma_temperatures(hass: HomeAssistant, setup_home, api):
     await _setup(hass, entry(temp_source="jma"))
-    api.open_meteo_daily.assert_not_called()
-    entity_id = _entity_id(hass)
-    st = hass.states.get(entity_id)
-    assert "Open-Meteo" not in st.attributes["attribution"]
-    fc = await _daily(hass, entity_id)
+    fc = await _daily(hass, _entity_id(hass))
     short = {a["area"]["code"]: a["temps"] for a in load("forecast_016000.json")[0]["timeSeries"][2]["areas"]}
     assert fc[0]["temperature"] == float(short["15356"][0])  # 岩見沢
     assert fc[0].get("templow") is None
 
 
 @pytest.mark.freeze_time(NOW)
-async def test_amedas_down_forecast_still_works(hass: HomeAssistant, setup_home, api):
+async def test_amedas_down_uses_open_meteo(hass: HomeAssistant, setup_home, api):
     api.observations.side_effect = JmaError("down")
     await _setup(hass, entry())
     st = hass.states.get(_entity_id(hass))
     assert st.state != "unavailable"
-    assert st.attributes.get("temperature") is None
-    assert st.attributes["condition_source"] == "forecast"
+    assert st.attributes["temperature"] == OM["current"]["temperature_2m"]
+    assert st.attributes["humidity"] == OM["current"]["relative_humidity_2m"]
+    assert st.attributes["observation_source"] == "open_meteo"
+    assert st.attributes["condition_source"] == "open_meteo"
+    assert st.attributes["daily_source"] == "jma"
+    assert any(p.startswith("アメダス") for p in st.attributes["problems"])
 
 
 @pytest.mark.freeze_time(NOW)
-async def test_missing_station_values(hass: HomeAssistant, setup_home, api):
+async def test_missing_station_values(hass: HomeAssistant, setup_home, api, caplog):
     obs = parse_amedas_point(load("amedas_missing.json"))
     for o in obs:
         o.time = o.time.replace(tzinfo=JST)
     api.observations.return_value = obs
     await _setup(hass, entry())
     st = hass.states.get(_entity_id(hass))
-    assert st.state != "unavailable"
-    assert st.attributes.get("temperature") is None
+    assert st.attributes["observation_source"] == "open_meteo"
+    assert "気温がありません" in caplog.text
+
+
+@pytest.mark.freeze_time(NOW)
+async def test_forecast_down_uses_open_meteo(hass: HomeAssistant, setup_home, api):
+    api.forecast.side_effect = JmaError("down")
+    await _setup(hass, entry())
+    st = hass.states.get(_entity_id(hass))
+    assert st.attributes["daily_source"] == "open_meteo"
+    assert st.attributes["observation_source"] == "amedas"
+    fc = await _daily(hass, _entity_id(hass))
+    assert len(fc) == 10
+    assert (fc[0]["temperature"], fc[0]["templow"]) == om_day(0)
+    assert fc[0]["precipitation_probability"] == OM["daily"]["precipitation_probability_max"][0]
+
+
+@pytest.mark.freeze_time(NOW)
+async def test_forecast_format_changed(hass: HomeAssistant, setup_home, api, caplog):
+    """形式が変わって地域が見つからないときは警告して Open-Meteo の予報を使う."""
+    broken = load("forecast_016000.json")
+    for ts in broken[0]["timeSeries"]:
+        for a in ts["areas"]:
+            a["area"]["code"] = "999999"
+    api.forecast.return_value = broken
+    await _setup(hass, entry())
+    st = hass.states.get(_entity_id(hass))
+    assert st.attributes["daily_source"] == "open_meteo"
+    assert "形式" in caplog.text
 
 
 @pytest.mark.freeze_time(NOW)
 async def test_open_meteo_down_falls_back_to_jma(hass: HomeAssistant, setup_home, api):
-    """Open-Meteo が取れないときは気象庁の予想気温を使う."""
-    api.open_meteo_daily.side_effect = JmaError("down")
+    """Open-Meteo が取れないときは気象庁の予想気温を使い、1時間ごとの予報は無し."""
+    api.open_meteo.side_effect = JmaError("down")
     await _setup(hass, entry())
     st = hass.states.get(_entity_id(hass))
     assert "Open-Meteo" not in st.attributes["attribution"]
+    assert st.attributes["hourly_source"] is None
     fc = await _daily(hass, _entity_id(hass))
     assert len(fc) == 8
     short = {a["area"]["code"]: a["temps"] for a in load("forecast_016000.json")[0]["timeSeries"][2]["areas"]}
     assert fc[0]["temperature"] == float(short["15356"][0])
+    assert await _forecast(hass, _entity_id(hass), "hourly") == []
 
 
 @pytest.mark.freeze_time("2026-11-17T23:00:00+00:00")  # 日本時間 18日 8:00
@@ -187,9 +244,10 @@ async def test_past_days_are_dropped(hass: HomeAssistant, setup_home, api):
     assert fc[0]["datetime"] == "2026-11-18T00:00:00+09:00"
 
 
-async def test_both_down_retries(hass: HomeAssistant, setup_home, api):
+async def test_all_down_retries(hass: HomeAssistant, setup_home, api):
     api.observations.side_effect = JmaError("down")
     api.forecast.side_effect = JmaError("down")
+    api.open_meteo.side_effect = JmaError("down")
     e = entry()
     await _setup(hass, e)
     assert e.state is ConfigEntryState.SETUP_RETRY
@@ -288,7 +346,7 @@ async def test_update_intervals(hass: HomeAssistant, setup_home, api, freezer):
     await _setup(hass, entry())
     assert api.observations.await_count == 1
     assert api.forecast.await_count == 1
-    assert api.open_meteo_daily.await_count == 1
+    assert api.open_meteo.await_count == 1
 
     async def step(minutes):
         freezer.tick(timedelta(minutes=minutes))
@@ -296,7 +354,7 @@ async def test_update_intervals(hass: HomeAssistant, setup_home, api, freezer):
         await hass.async_block_till_done()
 
     await step(5)  # アメダスだけ
-    assert (api.observations.await_count, api.forecast.await_count) == (2, 1)
+    assert (api.observations.await_count, api.forecast.await_count, api.open_meteo.await_count) == (2, 1, 1)
     # 予報の取得に失敗すると、次の5分後に取り直す
     api.forecast.side_effect = JmaError("down")
     await step(26)
@@ -307,6 +365,4 @@ async def test_update_intervals(hass: HomeAssistant, setup_home, api, freezer):
     assert api.forecast.await_count == failed + 1
     await step(5)
     assert api.forecast.await_count == failed + 1  # 成功後30分は取り直さない
-    assert api.open_meteo_daily.await_count == 1
-    await step(30)
-    assert api.open_meteo_daily.await_count == 2
+    assert api.open_meteo.await_count == 2  # Open-Meteo は30分ごと（31分の時点で1回）

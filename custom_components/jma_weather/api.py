@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import json
-import math
 from typing import Any
 
 import aiohttp
@@ -19,6 +18,17 @@ from .const import (
     URL_OPEN_METEO,
 )
 from .parse import Observation, parse_amedas_point, point_file_names
+
+OPEN_METEO_CURRENT = (
+    "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,weather_code,is_day"
+)
+OPEN_METEO_HOURLY = (
+    "temperature_2m,relative_humidity_2m,precipitation,precipitation_probability,"
+    "weather_code,wind_speed_10m,wind_direction_10m,is_day"
+)
+OPEN_METEO_DAILY = (
+    "temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
+)
 
 # 応答の上限（予報は数KB、area.json・amedastable.json は約250KB）
 _MAX_BYTES = 4 * 1024 * 1024
@@ -110,43 +120,18 @@ class JmaApi:
             obs.time = obs.time.replace(tzinfo=_JST)
         return observations
 
-    async def open_meteo_daily(
-        self, latitude: float, longitude: float
-    ) -> dict[date, tuple[float | None, float | None]]:
-        """地点の日ごとの最高・最低気温（日本時間の1日）."""
-        data = await self._get(
+    async def open_meteo(self, latitude: float, longitude: float) -> Any:
+        """地点の現在・1時間ごと・日ごとの予報（日本時間、風速 m/s）. 読むのは parse_open_meteo."""
+        return await self._get(
             URL_OPEN_METEO,
             params={
                 "latitude": f"{latitude:.4f}",
                 "longitude": f"{longitude:.4f}",
-                "daily": "temperature_2m_max,temperature_2m_min",
+                "current": OPEN_METEO_CURRENT,
+                "hourly": OPEN_METEO_HOURLY,
+                "daily": OPEN_METEO_DAILY,
                 "timezone": "Asia/Tokyo",
+                "wind_speed_unit": "ms",
                 "forecast_days": "10",
             },
         )
-        try:
-            daily = data["daily"]
-            days = daily["time"]
-            maxs = daily["temperature_2m_max"]
-            mins = daily["temperature_2m_min"]
-        except (KeyError, TypeError) as err:
-            raise JmaError("open-meteo: unexpected format") from err
-        result: dict[date, tuple[float | None, float | None]] = {}
-        for i, day in enumerate(days):
-            try:
-                d = date.fromisoformat(day)
-            except (TypeError, ValueError):
-                continue
-            result[d] = (
-                _num(maxs[i]) if i < len(maxs) else None,
-                _num(mins[i]) if i < len(mins) else None,
-            )
-        return result
-
-
-def _num(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value) if math.isfinite(value) else None
-
-

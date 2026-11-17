@@ -212,3 +212,48 @@ def test_current_condition_from_forecast():
     assert current_condition(dry, PARTLYCLOUDY, -10) == (PARTLYCLOUDY, "forecast")
     assert current_condition(dry, SUNNY, None) == (SUNNY, "forecast")
     assert current_condition([], None, 10) == (None, "none")
+
+
+from datetime import timedelta, timezone  # noqa: E402
+
+from custom_components.jma_weather.parse import (  # noqa: E402
+    condition_for_wmo,
+    parse_open_meteo,
+)
+
+JST = timezone(timedelta(hours=9))
+
+
+@pytest.mark.parametrize(
+    ("code", "is_day", "expected"),
+    [
+        (0, 1, SUNNY), (1, 1, SUNNY), (0, 0, CLEAR_NIGHT), (2, 1, PARTLYCLOUDY),
+        (3, 0, CLOUDY), (45, 1, FOG), (61, 1, RAINY), (65, 1, POURING),
+        (66, 1, SNOWY_RAINY), (73, 1, SNOWY), (95, 1, LIGHTNING_RAINY), (99, 1, "hail"),
+        (None, 1, None), (12, 1, None),
+    ],
+)
+def test_condition_for_wmo(code, is_day, expected):
+    assert condition_for_wmo(code, is_day) == expected
+
+
+def test_parse_open_meteo():
+    raw = load("open_meteo_sapporo.json")
+    om = parse_open_meteo(raw, JST)
+    assert om.current.temperature == raw["current"]["temperature_2m"]
+    assert om.current.time.tzinfo is not None
+    assert len(om.hours) == len(raw["hourly"]["time"])
+    assert om.hours[0].time == datetime(2026, 11, 17, 0, 0, tzinfo=JST)
+    assert len(om.days) == 10
+    d0 = om.days[date(2026, 11, 17)]
+    assert d0.temp_max == raw["daily"]["temperature_2m_max"][0]
+    assert d0.precipitation_probability == raw["daily"]["precipitation_probability_max"][0]
+
+
+def test_parse_open_meteo_broken():
+    with pytest.raises(ValueError):
+        parse_open_meteo([], JST)
+    with pytest.raises(ValueError):
+        parse_open_meteo({"error": True, "reason": "x"}, JST)
+    om = parse_open_meteo({"hourly": {"time": ["2026-11-17T00:00", "bad"], "temperature_2m": [1.0]}}, JST)
+    assert len(om.hours) == 1 and om.hours[0].condition is None

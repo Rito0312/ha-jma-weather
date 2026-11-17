@@ -22,12 +22,9 @@ URL_OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 
 UPDATE_INTERVAL = timedelta(minutes=5)
 FORECAST_INTERVAL = timedelta(minutes=30)
-OPEN_METEO_INTERVAL = timedelta(minutes=60)
+OPEN_METEO_INTERVAL = timedelta(minutes=30)
 # 観測がこれより古ければ使わない
 OBSERVATION_MAX_AGE = timedelta(hours=2)
 # 予報・Open-Meteo の取得に失敗しても、これより新しければ前回の値を使う
 FORECAST_MAX_AGE = timedelta(hours=12)
 REQUEST_TIMEOUT = 20
-
-ATTRIBUTION = "気象庁（府県天気予報・アメダス）"
-ATTRIBUTION_OPEN_METEO = "気象庁（府県天気予報・アメダス）, Open-Meteo（予想気温）"

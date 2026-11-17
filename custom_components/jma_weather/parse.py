@@ -386,3 +386,152 @@ def current_condition(
     if condition == SUNNY and night:
         condition = CLEAR_NIGHT
     return condition, "forecast"
+
+
+# ---- Open-Meteo（1時間ごとの予報と、気象庁のデータが取れないときの予備） ----
+
+HAIL = "hail"
+
+
+def condition_for_wmo(code: Any, is_day: Any = 1) -> str | None:
+    """Open-Meteo の天気コード（WMO）を HA の天気にする（HA 標準の open_meteo と同じ分け方）."""
+    c = _int_or_none(code)
+    if c is None:
+        return None
+    if c in (0, 1):
+        return SUNNY if is_day not in (0, False) else CLEAR_NIGHT
+    if c == 2:
+        return PARTLYCLOUDY
+    if c == 3:
+        return CLOUDY
+    if c in (45, 48):
+        return FOG
+    if c in (51, 53, 55, 61, 63, 80, 81):
+        return RAINY
+    if c in (65, 82):
+        return POURING
+    if c in (56, 57, 66, 67):
+        return SNOWY_RAINY
+    if c in (71, 73, 75, 77, 85, 86):
+        return SNOWY
+    if c == 95:
+        return LIGHTNING_RAINY
+    if c in (96, 99):
+        return HAIL
+    return None
+
+
+@dataclass
+class OpenMeteoCurrent:
+    time: datetime | None
+    temperature: float | None
+    humidity: float | None
+    wind_speed: float | None  # m/s
+    wind_bearing: float | None
+    condition: str | None
+
+
+@dataclass
+class OpenMeteoHour:
+    time: datetime
+    condition: str | None
+    temperature: float | None
+    humidity: float | None
+    precipitation: float | None
+    precipitation_probability: int | None
+    wind_speed: float | None  # m/s
+    wind_bearing: float | None
+
+
+@dataclass
+class OpenMeteoDay:
+    day: date
+    condition: str | None
+    temp_max: float | None
+    temp_min: float | None
+    precipitation_probability: int | None
+
+
+@dataclass
+class OpenMeteo:
+    current: OpenMeteoCurrent | None
+    hours: list[OpenMeteoHour]
+    days: dict[date, OpenMeteoDay]
+
+
+def _local_time(value: Any, tz) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        t = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=tz)
+
+
+def _col(block: dict, key: str, i: int) -> Any:
+    values = block.get(key)
+    if isinstance(values, list) and i < len(values):
+        return values[i]
+    return None
+
+
+def parse_open_meteo(data: Any, tz) -> OpenMeteo:
+    """Open-Meteo の応答（timezone 指定・wind_speed_unit=ms）を読む. 時刻は tz の時刻."""
+    if not isinstance(data, dict):
+        raise ValueError("open-meteo: not an object")
+    current = None
+    cur = data.get("current")
+    if isinstance(cur, dict):
+        bearing = _float_or_none(cur.get("wind_direction_10m"))
+        current = OpenMeteoCurrent(
+            time=_local_time(cur.get("time"), tz),
+            temperature=_float_or_none(cur.get("temperature_2m")),
+            humidity=_float_or_none(cur.get("relative_humidity_2m")),
+            wind_speed=_float_or_none(cur.get("wind_speed_10m")),
+            wind_bearing=bearing,
+            condition=condition_for_wmo(cur.get("weather_code"), cur.get("is_day", 1)),
+        )
+    hours: list[OpenMeteoHour] = []
+    hourly = data.get("hourly")
+    if isinstance(hourly, dict) and isinstance(hourly.get("time"), list):
+        for i, t in enumerate(hourly["time"]):
+            when = _local_time(t, tz)
+            if when is None:
+                continue
+            hours.append(
+                OpenMeteoHour(
+                    time=when,
+                    condition=condition_for_wmo(
+                        _col(hourly, "weather_code", i), _col(hourly, "is_day", i)
+                    ),
+                    temperature=_float_or_none(_col(hourly, "temperature_2m", i)),
+                    humidity=_float_or_none(_col(hourly, "relative_humidity_2m", i)),
+                    precipitation=_float_or_none(_col(hourly, "precipitation", i)),
+                    precipitation_probability=_int_or_none(
+                        _col(hourly, "precipitation_probability", i)
+                    ),
+                    wind_speed=_float_or_none(_col(hourly, "wind_speed_10m", i)),
+                    wind_bearing=_float_or_none(_col(hourly, "wind_direction_10m", i)),
+                )
+            )
+    days: dict[date, OpenMeteoDay] = {}
+    daily = data.get("daily")
+    if isinstance(daily, dict) and isinstance(daily.get("time"), list):
+        for i, t in enumerate(daily["time"]):
+            try:
+                d = date.fromisoformat(t)
+            except (TypeError, ValueError):
+                continue
+            days[d] = OpenMeteoDay(
+                day=d,
+                condition=condition_for_wmo(_col(daily, "weather_code", i)),
+                temp_max=_float_or_none(_col(daily, "temperature_2m_max", i)),
+                temp_min=_float_or_none(_col(daily, "temperature_2m_min", i)),
+                precipitation_probability=_int_or_none(
+                    _col(daily, "precipitation_probability_max", i)
+                ),
+            )
+    if current is None and not hours and not days:
+        raise ValueError("open-meteo: no data")
+    return OpenMeteo(current=current, hours=hours, days=days)
