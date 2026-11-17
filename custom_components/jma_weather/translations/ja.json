@@ -1,0 +1,54 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "府県（予報を出す気象台）",
+        "description": "天気予報を使う府県を選んでください。",
+        "data": {
+          "office": "府県"
+        }
+      },
+      "details": {
+        "title": "地域と観測地点",
+        "description": "現在の気温・湿度・風はアメダス、天気と降水確率は気象庁の府県天気予報を使います。",
+        "data": {
+          "area": "予報の地域",
+          "station": "アメダスの地点（現在の観測値）",
+          "temp_source": "予想の最高・最低気温",
+          "temp_station": "気象庁の予想気温の地点"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "気象庁のデータを取得できませんでした。",
+      "no_data": "この府県の予報またはアメダス地点が見つかりません。"
+    },
+    "abort": {
+      "cannot_connect": "気象庁のデータを取得できませんでした。",
+      "already_configured": "この地域と地点は設定済みです。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "設定の変更",
+        "data": {
+          "station": "アメダスの地点（現在の観測値）",
+          "temp_source": "予想の最高・最低気温",
+          "temp_station": "気象庁の予想気温の地点"
+        }
+      }
+    },
+    "abort": {
+      "cannot_connect": "気象庁のデータを取得できませんでした。"
+    }
+  },
+  "selector": {
+    "temp_source": {
+      "options": {
+        "open_meteo": "Open-Meteo（自宅の地点）",
+        "jma": "気象庁（予想気温の地点）"
+      }
+    }
+  }
+}

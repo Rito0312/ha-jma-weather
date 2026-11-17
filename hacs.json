@@ -1,0 +1,5 @@
+{
+  "name": "JMA Weather（気象庁の天気予報＋アメダス）",
+  "render_readme": true,
+  "homeassistant": "2025.2.0"
+}

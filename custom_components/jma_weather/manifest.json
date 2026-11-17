@@ -1,0 +1,12 @@
+{
+  "domain": "jma_weather",
+  "name": "JMA Weather（気象庁の天気予報＋アメダス）",
+  "codeowners": ["@Rito0312"],
+  "config_flow": true,
+  "documentation": "https://github.com/Rito0312/ha-jma-weather",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/Rito0312/ha-jma-weather/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

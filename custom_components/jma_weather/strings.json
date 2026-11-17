@@ -1,0 +1,54 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Prefecture (forecast office)",
+        "description": "Choose the prefecture whose JMA forecast to use.",
+        "data": {
+          "office": "Prefecture"
+        }
+      },
+      "details": {
+        "title": "Area and station",
+        "description": "Current temperature, humidity and wind come from AMeDAS; condition and precipitation probability come from the JMA forecast.",
+        "data": {
+          "area": "Forecast area",
+          "station": "AMeDAS station (current observations)",
+          "temp_source": "Forecast high/low temperatures",
+          "temp_station": "JMA temperature forecast point"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not fetch data from JMA.",
+      "no_data": "No forecast area or AMeDAS station found."
+    },
+    "abort": {
+      "cannot_connect": "Could not fetch data from JMA.",
+      "already_configured": "This area and station are already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options",
+        "data": {
+          "station": "AMeDAS station (current observations)",
+          "temp_source": "Forecast high/low temperatures",
+          "temp_station": "JMA temperature forecast point"
+        }
+      }
+    },
+    "abort": {
+      "cannot_connect": "Could not fetch data from JMA."
+    }
+  },
+  "selector": {
+    "temp_source": {
+      "options": {
+        "open_meteo": "Open-Meteo (home location)",
+        "jma": "JMA (forecast point)"
+      }
+    }
+  }
+}
