@@ -33,6 +33,7 @@ OPEN_METEO_CURRENT_MAX_AGE = timedelta(hours=2)
 SRC_AMEDAS = "amedas"
 SRC_JMA = "jma"
 SRC_OPEN_METEO = "open_meteo"
+SRC_GRID = "jma_grid"
 
 
 async def async_setup_entry(
@@ -96,14 +97,18 @@ class JmaWeather(SingleCoordinatorWeatherEntity[JmaCoordinator]):
             return None
         return cur
 
-    def _today_condition(self) -> str | None:
-        today = dt_util.now().date()
+    def _forecast_hint(self) -> tuple[str | None, str]:
+        """予報から見た今の天気: 自宅のマスの今の3時間 → 府県天気予報の今日 → Open-Meteo の今日."""
+        now = dt_util.now()
         data = self._data
+        if data and data.grid and (step := data.grid.step_at(now)):
+            return step.condition_at(now), SRC_GRID
+        today = now.date()
         if data and data.forecast and (d := data.forecast.get(today)) and d.condition:
-            return d.condition
+            return d.condition, "forecast"
         if data and data.open_meteo and (d := data.open_meteo.days.get(today)):
-            return d.condition
-        return None
+            return d.condition, SRC_OPEN_METEO
+        return None, "none"
 
     def _sun_elevation(self) -> float | None:
         try:
@@ -113,10 +118,11 @@ class JmaWeather(SingleCoordinatorWeatherEntity[JmaCoordinator]):
             return None
 
     def _current(self) -> tuple[str | None, str]:
+        hint, hint_source = self._forecast_hint()
         if self._latest() is not None:
-            condition, how = current_condition(
-                self._recent(), self._today_condition(), self._sun_elevation()
-            )
+            condition, how = current_condition(self._recent(), hint, self._sun_elevation())
+            if how == "forecast":
+                how = hint_source
             if how != "none":
                 return condition, how
         cur = self._om_current()
@@ -172,7 +178,7 @@ class JmaWeather(SingleCoordinatorWeatherEntity[JmaCoordinator]):
             "condition_source": self._current()[1],
             "observation_source": self._observed("temperature")[1],
             "daily_source": self._daily_source(),
-            "hourly_source": SRC_OPEN_METEO if self._hourly() else None,
+            "hourly_source": self._hourly_source(),
         }
         latest = self._latest()
         if latest:
@@ -225,6 +231,10 @@ class JmaWeather(SingleCoordinatorWeatherEntity[JmaCoordinator]):
                     high, low = om.temp_max, om.temp_min
                 else:
                     high, low = day.temp_max, day.temp_min
+                # 今日・明日は自宅のマスの最高・最低（天気分布予報）があればそれ
+                if data.grid:
+                    high = data.grid.daily_max.get(day.day, high)
+                    low = data.grid.daily_min.get(day.day, low)
                 item: HAForecast = {
                     "datetime": datetime.combine(day.day, time(0), tz).isoformat(),
                     "condition": day.condition,
@@ -250,26 +260,51 @@ class JmaWeather(SingleCoordinatorWeatherEntity[JmaCoordinator]):
                 result.append(item)
         return result or None
 
+    def _hourly_source(self) -> str | None:
+        data = self._data
+        if not data or not data.open_meteo or not data.open_meteo.hours:
+            return None
+        return "jma_grid+open_meteo" if data.grid else SRC_OPEN_METEO
+
     def _hourly(self) -> list[HAForecast] | None:
+        """1時間ごと: 時刻・湿度・風は Open-Meteo. 明日までは天気・気温・降水量を自宅のマス、
+        降水確率を府県天気予報の6時間ごとの値（気象庁）に置き換える."""
         data = self._data
         if not data or not data.open_meteo:
             return None
+        grid = data.grid
+        forecast = data.forecast
         start = dt_util.now().replace(minute=0, second=0, microsecond=0)
         result: list[HAForecast] = []
         for h in data.open_meteo.hours:
-            if h.time < start or h.condition is None:
+            if h.time < start:
+                continue
+            condition = h.condition
+            temperature = h.temperature
+            precipitation = h.precipitation
+            pop = h.precipitation_probability
+            step = grid.step_at(h.time) if grid else None
+            if step is not None:
+                condition = step.condition_at(h.time)
+                precipitation = step.precipitation_per_hour
+                t = grid.temperature_at(h.time)
+                if t is not None:
+                    temperature = t
+            if forecast is not None and (p := forecast.pop_at(h.time)) is not None:
+                pop = p
+            if condition is None:
                 continue
             item: HAForecast = {
                 "datetime": h.time.isoformat(),
-                "condition": h.condition,
-                "native_temperature": h.temperature,
+                "condition": condition,
+                "native_temperature": temperature,
                 "humidity": h.humidity,
-                "native_precipitation": h.precipitation,
+                "native_precipitation": precipitation,
                 "native_wind_speed": h.wind_speed,
                 "wind_bearing": h.wind_bearing,
             }
-            if h.precipitation_probability is not None:
-                item["precipitation_probability"] = h.precipitation_probability
+            if pop is not None:
+                item["precipitation_probability"] = pop
             result.append(item)
             if len(result) >= HOURLY_HOURS:
                 break

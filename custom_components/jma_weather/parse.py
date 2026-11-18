@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import math
 from typing import Any
 
@@ -113,6 +113,14 @@ class Forecast:
     report_time: datetime | None
     area_name: str | None
     days: list[ForecastDay] = field(default_factory=list)
+    # 6時間ごとの降水確率 [(始まり, 終わり, %)]
+    pop_blocks: list[tuple[datetime, datetime, int]] = field(default_factory=list)
+
+    def pop_at(self, when: datetime) -> int | None:
+        for start, end, pop in self.pop_blocks:
+            if start <= when < end:
+                return pop
+        return None
 
     def get(self, day: date) -> ForecastDay | None:
         for item in self.days:
@@ -149,6 +157,7 @@ def parse_forecast(
     - 気温: temp_station（予想気温の地点）の値。3日分の予報の 00時=最低、09時=最高、無ければ週間予報
     """
     days: dict[date, ForecastDay] = {}
+    pop_blocks: list[tuple[datetime, datetime, int]] = []
 
     def day_of(d: date) -> ForecastDay:
         if d not in days:
@@ -223,7 +232,9 @@ def parse_forecast(
                 pop = _int_or_none(pops[i]) if i < len(pops) else None
                 if pop is None:
                     continue
-                d = _dt(t).date()
+                start = _dt(t)
+                pop_blocks.append((start, start + timedelta(hours=6), pop))
+                d = start.date()
                 block_max[d] = max(block_max.get(d, 0), pop)
             for d, pop in block_max.items():
                 day_of(d).precipitation_probability = pop
@@ -264,6 +275,7 @@ def parse_forecast(
         report_time=report_time,
         area_name=area_name,
         days=[days[d] for d in sorted(days)],
+        pop_blocks=pop_blocks,
     )
 
 
@@ -535,3 +547,182 @@ def parse_open_meteo(data: Any, tz) -> OpenMeteo:
     if current is None and not hours and not days:
         raise ValueError("open-meteo: no data")
     return OpenMeteo(current=current, hours=hours, days=days)
+
+
+# ---- 天気分布予報（約5km四方のマス、3時間ごと） ----
+#
+# 気象庁の天気分布予報の地図用データ（GeoJSON）から、1つの地点を含むマスの値を読む。
+# 実データで確認した決まり（2026-11-17）:
+#   - targetTimes.json の basetime・validtime は UTC
+#   - 天気（wm）と3時間降水量（r3）は「validtime までの3時間」の値
+#     （地域時系列予報の 18:00〜21:00 の天気が validtime 21:00 のマスと一致）
+#   - 気温（temp_point）は validtime の時点の値。マスの中心の点で、値は文字列の整数
+#   - min_temp_point・max_temp_point はその日の朝の最低・日中の最高（validtime の日付の日）
+
+GRID_CONDITIONS = {
+    "Clear": SUNNY,
+    "Cloudy": CLOUDY,
+    "Rain": RAINY,
+    "Rain/snow": SNOWY_RAINY,
+    "Snow": SNOWY,
+}
+
+# 3時間降水量の区分 → 1時間あたりの目安（区分の中央を3で割る。20mm以上は 25mm として）
+R3_PER_HOUR = {
+    "1<=mm<5": 1.0,
+    "5<=mm<10": 2.5,
+    "10<=mm<15": 4.2,
+    "15<=mm<20": 5.8,
+    "20<=mm": 8.3,
+}
+# 3時間で20mm以上なら激しい雨
+R3_POURING = "20<=mm"
+
+
+def _point_in_rings(rings: Any, x: float, y: float) -> bool:
+    """偶奇規則（穴・離れた複数のマスのどちらの書き方でも正しく判定できる）."""
+    inside = False
+    if not isinstance(rings, list):
+        return False
+    for ring in rings:
+        if not isinstance(ring, list):
+            continue
+        for i in range(len(ring) - 1):
+            try:
+                x1, y1 = float(ring[i][0]), float(ring[i][1])
+                x2, y2 = float(ring[i + 1][0]), float(ring[i + 1][1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+                inside = not inside
+    return inside
+
+
+def grid_level(data: Any, latitude: float, longitude: float) -> str | None:
+    """区分ごとの多角形（wm・r3）から、地点を含む区分の名前. どれにも入らなければ None."""
+    if not isinstance(data, dict):
+        raise ValueError("grid: not an object")
+    features = data.get("features")
+    if not isinstance(features, list):
+        raise ValueError("grid: no features")
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        geometry = feature.get("geometry") or {}
+        level = (feature.get("properties") or {}).get("level")
+        coords = geometry.get("coordinates")
+        if geometry.get("type") == "Polygon":
+            polygons = [coords]
+        elif geometry.get("type") == "MultiPolygon":
+            polygons = coords if isinstance(coords, list) else []
+        else:
+            continue
+        if any(_point_in_rings(p, longitude, latitude) for p in polygons):
+            return level if isinstance(level, str) else None
+    return None
+
+
+# マスの大きさ（経度0.0625度・緯度0.05度）。最も近い点がこれより離れていれば使わない
+_MAX_POINT_DISTANCE = 0.06
+
+
+def grid_point_value(data: Any, latitude: float, longitude: float) -> float | None:
+    """マスの中心の点（temp_point など）から、地点に最も近い点の値."""
+    if not isinstance(data, dict):
+        raise ValueError("grid: not an object")
+    features = data.get("features")
+    if not isinstance(features, list):
+        raise ValueError("grid: no features")
+    best = None
+    best_d = None
+    for feature in features:
+        try:
+            x, y = feature["geometry"]["coordinates"][:2]
+            dx = (float(x) - longitude) / 1.25  # 経度の方がマスが大きい
+            dy = float(y) - latitude
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        d = dx * dx + dy * dy
+        if best_d is None or d < best_d:
+            best, best_d = feature, d
+    if best is None or best_d is None or best_d > _MAX_POINT_DISTANCE**2:
+        return None
+    return _float_or_none((best.get("properties") or {}).get("value"))
+
+
+@dataclass
+class GridStep:
+    """validtime までの3時間（天気・降水量）と、validtime の時点の気温."""
+
+    end: datetime
+    condition: str | None = None
+    rain_level: str | None = None
+    temperature: float | None = None
+
+    @property
+    def start(self) -> datetime:
+        return self.end - timedelta(hours=3)
+
+    @property
+    def precipitation_per_hour(self) -> float | None:
+        if self.condition is None:
+            return None
+        return R3_PER_HOUR.get(self.rain_level or "", 0.0)
+
+    def condition_at(self, when: datetime) -> str | None:
+        """その時刻の天気（晴れは 6〜18時を昼として晴れ・夜の晴れに分ける. 気象庁のページと同じ）."""
+        if self.condition == SUNNY and not 6 <= when.hour < 18:
+            return CLEAR_NIGHT
+        if self.condition == RAINY and self.rain_level == R3_POURING:
+            return POURING
+        return self.condition
+
+
+@dataclass
+class GridForecast:
+    basetime: datetime
+    steps: list[GridStep]
+    daily_min: dict[date, float]
+    daily_max: dict[date, float]
+
+    def step_at(self, when: datetime) -> GridStep | None:
+        for step in self.steps:
+            if step.condition is not None and step.start <= when < step.end:
+                return step
+        return None
+
+    def temperature_at(self, when: datetime) -> float | None:
+        """3時間ごとの気温を直線でつないだ値."""
+        points = [(s.end, s.temperature) for s in self.steps if s.temperature is not None]
+        points.sort()
+        for (t1, v1), (t2, v2) in zip(points, points[1:]):
+            if t1 <= when <= t2:
+                span = (t2 - t1).total_seconds()
+                if span <= 0:
+                    return v1
+                return round(v1 + (v2 - v1) * (when - t1).total_seconds() / span, 1)
+        return None
+
+
+def parse_target_times(data: Any) -> tuple[str, list[tuple[str, list[str]]]]:
+    """最新の basetime と、その validtime・要素の一覧（validtime 順）."""
+    if not isinstance(data, list) or not data:
+        raise ValueError("targetTimes: unexpected format")
+    rows = [
+        r for r in data
+        if isinstance(r, dict) and isinstance(r.get("basetime"), str)
+        and isinstance(r.get("validtime"), str) and isinstance(r.get("elements"), list)
+    ]
+    if not rows:
+        raise ValueError("targetTimes: no rows")
+    basetime = max(r["basetime"] for r in rows)
+    steps = sorted(
+        (r["validtime"], [e for e in r["elements"] if isinstance(e, str)])
+        for r in rows if r["basetime"] == basetime
+    )
+    return basetime, steps
+
+
+def utc_stamp(value: str) -> datetime:
+    """targetTimes の時刻（UTC、YYYYmmddHHMMSS）."""
+    return datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)

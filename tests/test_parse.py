@@ -257,3 +257,97 @@ def test_parse_open_meteo_broken():
         parse_open_meteo({"error": True, "reason": "x"}, JST)
     om = parse_open_meteo({"hourly": {"time": ["2026-11-17T00:00", "bad"], "temperature_2m": [1.0]}}, JST)
     assert len(om.hours) == 1 and om.hours[0].condition is None
+
+
+from custom_components.jma_weather.api import JmaError, load_grid  # noqa: E402
+from custom_components.jma_weather.parse import (  # noqa: E402
+    GridForecast,
+    GridStep,
+    grid_level,
+    grid_point_value,
+    parse_target_times,
+    utc_stamp,
+)
+
+
+def _fc(*features):
+    return {"type": "FeatureCollection", "features": list(features)}
+
+
+def _poly(level, *rings):
+    return {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": list(rings)},
+            "properties": {"level": level}}
+
+
+SQ = [[135.0, 34.7], [135.1, 34.7], [135.1, 34.6], [135.0, 34.6], [135.0, 34.7]]
+SQ2 = [[136.0, 34.7], [136.1, 34.7], [136.1, 34.6], [136.0, 34.6], [136.0, 34.7]]
+
+
+def test_grid_level():
+    data = _fc(_poly("Snow"), _poly("Cloudy", SQ2), _poly("Rain", SQ2, SQ))
+    assert grid_level(data, 34.65, 135.05) == "Rain"  # 離れた2つ目のマス
+    assert grid_level(data, 34.65, 136.05) == "Cloudy"
+    assert grid_level(data, 34.65, 135.5) is None
+    with pytest.raises(ValueError):
+        grid_level([], 0, 0)
+    with pytest.raises(ValueError):
+        grid_level({"type": "x"}, 0, 0)
+
+
+def test_grid_point_value():
+    pts = _fc(
+        {"geometry": {"coordinates": [135.531, 34.675]}, "properties": {"value": "11"}},
+        {"geometry": {"coordinates": [135.594, 34.675]}, "properties": {"value": "12"}},
+        {"geometry": {"coordinates": "bad"}, "properties": {}},
+    )
+    assert grid_point_value(pts, 34.66, 135.52) == 11
+    assert grid_point_value(pts, 34.67, 135.58) == 12
+    assert grid_point_value(pts, 35.5, 135.52) is None  # 近い点が無い
+
+
+def test_load_grid():
+    import gzip
+
+    assert load_grid(gzip.compress(b'{"a": 1}')) == {"a": 1}
+    assert load_grid(b'{"a": 1}') == {"a": 1}
+    with pytest.raises(JmaError):
+        load_grid(b"\x1f\x8bbroken")
+    with pytest.raises(JmaError):
+        load_grid(gzip.compress(b"x" * (33 * 1024 * 1024)))
+
+
+def test_parse_target_times():
+    data = [
+        {"basetime": "20261117020000", "validtime": "20261117060000", "elements": ["wm"]},
+        {"basetime": "20261117080000", "validtime": "20261117120000", "elements": ["wm", "r3"]},
+        {"basetime": "20261117080000", "validtime": "20261117090000", "elements": ["temp_point"]},
+        "junk",
+    ]
+    base, steps = parse_target_times(data)
+    assert base == "20261117080000"
+    assert steps == [("20261117090000", ["temp_point"]), ("20261117120000", ["wm", "r3"])]
+    assert utc_stamp(base) == datetime(2026, 11, 17, 8, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        parse_target_times({})
+
+
+def test_grid_forecast_lookup():
+    t = datetime(2026, 11, 17, 18, tzinfo=JST)
+    steps = [
+        GridStep(end=t, condition=None, temperature=9.0),  # 最初は気温だけ
+        GridStep(end=t + timedelta(hours=3), condition=SUNNY, temperature=12.0),
+        GridStep(end=t + timedelta(hours=6), condition=RAINY, rain_level="20<=mm", temperature=6.0),
+    ]
+    g = GridForecast(basetime=t, steps=steps, daily_min={}, daily_max={})
+    assert g.step_at(t - timedelta(hours=1)) is None
+    s1 = g.step_at(t + timedelta(hours=1))
+    assert s1.condition_at(t + timedelta(hours=1)) == CLEAR_NIGHT
+    assert s1.precipitation_per_hour == 0.0
+    s2 = g.step_at(t + timedelta(hours=4))
+    assert s2.condition_at(t + timedelta(hours=4)) == POURING
+    assert s2.precipitation_per_hour == 8.3
+    assert g.temperature_at(t + timedelta(hours=1)) == 10.0
+    assert g.temperature_at(t + timedelta(hours=4)) == 10.0
+    assert g.temperature_at(t + timedelta(hours=7)) is None
+    day = GridStep(end=datetime(2026, 11, 18, 9, tzinfo=JST), condition=SUNNY)
+    assert day.condition_at(datetime(2026, 11, 18, 7, tzinfo=JST)) == SUNNY

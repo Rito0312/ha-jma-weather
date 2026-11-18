@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import JmaApi, JmaError
+from .api import JmaApi, JmaError, load_grid
 from .const import (
     CONF_AREA,
     CONF_OFFICE,
@@ -19,17 +19,44 @@ from .const import (
     DOMAIN,
     FORECAST_INTERVAL,
     FORECAST_MAX_AGE,
+    GRID_INTERVAL,
     OBSERVATION_MAX_AGE,
     OPEN_METEO_INTERVAL,
     UPDATE_INTERVAL,
 )
-from .parse import Forecast, Observation, OpenMeteo, parse_forecast, parse_open_meteo
+from .parse import (
+    GRID_CONDITIONS,
+    Forecast,
+    GridForecast,
+    GridStep,
+    Observation,
+    OpenMeteo,
+    grid_level,
+    grid_point_value,
+    parse_forecast,
+    parse_open_meteo,
+    parse_target_times,
+    utc_stamp,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 SOURCE_AMEDAS = "アメダス"
 SOURCE_FORECAST = "気象庁の天気予報"
 SOURCE_OPEN_METEO = "Open-Meteo"
+SOURCE_GRID = "天気分布予報"
+
+# 天気分布予報の要素 → 読み方
+_GRID_LEVEL = ("wm", "r3")
+_GRID_POINT = ("temp_point", "min_temp_point", "max_temp_point")
+
+
+def _extract(body: bytes, element: str, latitude: float, longitude: float):
+    """（executor で実行）1枚を展開して、地点のマスの値だけ返す."""
+    data = load_grid(body)
+    if element in _GRID_LEVEL:
+        return grid_level(data, latitude, longitude)
+    return grid_point_value(data, latitude, longitude)
 
 
 @dataclass
@@ -37,6 +64,7 @@ class JmaData:
     observations: list[Observation]
     forecast: Forecast | None
     open_meteo: OpenMeteo | None
+    grid: GridForecast | None = None
     problems: list[str] = field(default_factory=list)
 
 
@@ -57,6 +85,8 @@ class JmaCoordinator(DataUpdateCoordinator[JmaData]):
         self._forecast_at: datetime | None = None
         self._om: OpenMeteo | None = None
         self._om_at: datetime | None = None
+        self._grid: GridForecast | None = None
+        self._grid_checked: datetime | None = None
         self._failing: dict[str, str] = {}
 
     @property
@@ -126,6 +156,62 @@ class JmaCoordinator(DataUpdateCoordinator[JmaData]):
         self._om_at = dt_util.utcnow()
         self._recovered(SOURCE_OPEN_METEO)
 
+    async def _update_grid(self) -> None:
+        lat, lon = self.hass.config.latitude, self.hass.config.longitude
+        try:
+            basetime, steps = parse_target_times(await self.api.grid_times())
+        except JmaError as err:
+            self._problem(SOURCE_GRID, f"取得に失敗しました（{err}）")
+            return
+        except (ValueError, TypeError) as err:
+            self._problem(SOURCE_GRID, f"読み取れません（データの形式が変わった可能性: {err}）")
+            return
+        base = utc_stamp(basetime)
+        if self._grid is not None and self._grid.basetime == base:
+            return  # 新しい発表は無い
+        tz = dt_util.get_default_time_zone()
+        grid_steps: list[GridStep] = []
+        daily_min: dict = {}
+        daily_max: dict = {}
+        try:
+            for validtime, elements in steps:
+                end = utc_stamp(validtime).astimezone(tz)
+                step = GridStep(end=end)
+                for element in ("wm", "r3", "temp_point", "min_temp_point", "max_temp_point"):
+                    if element not in elements:
+                        continue
+                    body = await self.api.grid_layer(basetime, validtime, element)
+                    value = await self.hass.async_add_executor_job(
+                        _extract, body, element, lat, lon
+                    )
+                    if element == "wm":
+                        step.condition = GRID_CONDITIONS.get(value) if value else None
+                        if value is None:
+                            # 区分のどれにも入らない＝地点が予報の範囲外か、形式が変わった
+                            raise ValueError(f"{validtime}: 地点のマスの天気がありません")
+                    elif element == "r3":
+                        step.rain_level = value
+                    elif element == "temp_point":
+                        step.temperature = value
+                    elif element == "min_temp_point" and value is not None:
+                        daily_min[end.date()] = value
+                    elif element == "max_temp_point" and value is not None:
+                        daily_max[end.date()] = value
+                grid_steps.append(step)
+        except JmaError as err:
+            self._problem(SOURCE_GRID, f"取得に失敗しました（{err}）")
+            return
+        except (ValueError, TypeError, KeyError) as err:
+            self._problem(SOURCE_GRID, f"読み取れません（データの形式が変わった可能性: {err}）")
+            return
+        if not any(s.condition for s in grid_steps):
+            self._problem(SOURCE_GRID, "天気がありません（データの形式が変わった可能性）")
+            return
+        self._grid = GridForecast(
+            basetime=base, steps=grid_steps, daily_min=daily_min, daily_max=daily_max
+        )
+        self._recovered(SOURCE_GRID)
+
     async def _async_update_data(self) -> JmaData:
         now = dt_util.utcnow()
         s = self.settings
@@ -136,12 +222,17 @@ class JmaCoordinator(DataUpdateCoordinator[JmaData]):
             await self._update_forecast(s[CONF_OFFICE], s[CONF_AREA], s.get(CONF_TEMP_STATION))
         if self._om_at is None or now - self._om_at >= OPEN_METEO_INTERVAL:
             await self._update_open_meteo()
+        if self._grid_checked is None or now - self._grid_checked >= GRID_INTERVAL:
+            self._grid_checked = now
+            await self._update_grid()
 
         observations = [o for o in self._observations if now - o.time <= OBSERVATION_MAX_AGE]
         forecast = self._forecast if (
             self._forecast_at and now - self._forecast_at <= FORECAST_MAX_AGE
         ) else None
         om = self._om if self._om_at and now - self._om_at <= FORECAST_MAX_AGE else None
+        # 天気分布予報は発表から24時間（最後の予報時刻まで）使う
+        grid = self._grid if self._grid and now - self._grid.basetime <= timedelta(hours=24) else None
 
         if not any(o.temperature is not None for o in observations) and forecast is None and om is None:
             raise UpdateFailed("アメダス・気象庁の天気予報・Open-Meteo のどれも取得できません")
@@ -149,5 +240,6 @@ class JmaCoordinator(DataUpdateCoordinator[JmaData]):
             observations=observations,
             forecast=forecast,
             open_meteo=om,
+            grid=grid,
             problems=[f"{k}: {v}" for k, v in self._failing.items()],
         )

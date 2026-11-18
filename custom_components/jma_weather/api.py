@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+import zlib
 from typing import Any
 
 import aiohttp
@@ -15,6 +16,8 @@ from .const import (
     URL_AMEDAS_TABLE,
     URL_AREA,
     URL_FORECAST,
+    URL_GRID,
+    URL_GRID_TIMES,
     URL_OPEN_METEO,
 )
 from .parse import Observation, parse_amedas_point, point_file_names
@@ -40,11 +43,35 @@ class JmaError(Exception):
     """取得に失敗した."""
 
 
+# 展開後の上限（天気分布予報の気温の点は約3MB）
+_MAX_DECODED = 32 * 1024 * 1024
+
+
+def load_grid(body: bytes) -> Any:
+    """天気分布予報の GeoJSON を読む（gzip のまま届くときと、aiohttp が展開済みのときがある）."""
+    if body[:2] == b"\x1f\x8b":
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            out = d.decompress(body, _MAX_DECODED + 1)
+        except zlib.error as err:
+            raise JmaError("grid: broken gzip") from err
+        if len(out) > _MAX_DECODED or d.unconsumed_tail:
+            raise JmaError("grid: too large")
+        body = out
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as err:
+        raise JmaError("grid: invalid JSON") from err
+
+
 class JmaApi:
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
 
-    async def _get(self, url: str, params: dict | None = None, text: bool = False) -> Any:
+    async def _get_bytes(
+        self, url: str, params: dict | None = None, max_bytes: int | None = None
+    ) -> bytes:
+        limit = max_bytes or _MAX_BYTES
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 async with self._session.get(url, params=params) as resp:
@@ -55,12 +82,16 @@ class JmaApi:
                     size = 0
                     async for chunk in resp.content.iter_chunked(65536):
                         size += len(chunk)
-                        if size > _MAX_BYTES:
+                        if size > limit:
                             raise JmaError(f"{url}: response too large")
                         chunks.append(chunk)
                     body = b"".join(chunks)
         except (aiohttp.ClientError, TimeoutError) as err:
             raise JmaError(f"{url}: {err!r}") from err
+        return body
+
+    async def _get(self, url: str, params: dict | None = None, text: bool = False) -> Any:
+        body = await self._get_bytes(url, params)
         try:
             decoded = body.decode("utf-8")
         except UnicodeDecodeError as err:
@@ -119,6 +150,17 @@ class JmaApi:
         for obs in observations:
             obs.time = obs.time.replace(tzinfo=_JST)
         return observations
+
+    async def grid_times(self) -> Any:
+        return await self._get(URL_GRID_TIMES)
+
+    async def grid_layer(self, basetime: str, validtime: str, element: str) -> bytes:
+        """天気分布予報の1枚（バイト列のまま）. 展開と読み取りは load_grid（重いので executor で）."""
+        # aiohttp が展開して受け取ることがある（気温の点は展開後 約4MB）
+        return await self._get_bytes(
+            URL_GRID.format(basetime=basetime, validtime=validtime, element=element),
+            max_bytes=_MAX_DECODED,
+        )
 
     async def open_meteo(self, latitude: float, longitude: float) -> Any:
         """地点の現在・1時間ごと・日ごとの予報（日本時間、風速 m/s）. 読むのは parse_open_meteo."""
